@@ -2,6 +2,13 @@ import numpy as np
 import sympy
 
 
+"""
+Here we calculate chance of dying on a turn by calculating up to the turn before, 
+then finding out the chance of dealing enough to finish the opponent off
+from there we get the expected value and variance for approximation
+"""
+
+
 def damage_chances(coefficients, s, k):
     x = sympy.symbols('x')
     expr = sympy.Rational(1, s) * sum(c * x ** i for i, c in enumerate(coefficients, 1))

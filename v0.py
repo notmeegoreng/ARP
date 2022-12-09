@@ -4,6 +4,13 @@ from fractions import Fraction
 import test
 
 
+"""
+This algorithm relies on variations of Pascal's Triangle 
+where the initial row is the coeffs of the mgf of damage dealt
+it was abandoned when we realised that our method of calculating coefficients from previous rows was not generalisable
+"""
+
+
 class Algo:
     def __init__(self, faces):
         self.f = faces
