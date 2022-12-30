@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import dataclasses
 import decimal
 import functools
@@ -12,8 +10,11 @@ x = sympy.symbols('x')
 
 
 """
-Optimise to not need to calc the rest of the binomial series when the number of hits 
-ensures that chance to kill is 1
+Realise a new approach
+1. realise that finding the chance of dying on a turn is simply the chance of dying on or before that turn minus the
+chance of dying on or before the previous turn
+2. realise that we can use a binomial distribution to find the number of attacks that hit at a certain turn, 
+then multiply with the probabilities of winning the fight with a certain number of attacks
 """
 
 
@@ -29,7 +30,7 @@ class Player:
         return cls(hp, to_expr(coeffs), hit_chance, initiative_mod)
 
 
-def get_combined_dice(dice: dict[int, int]) -> np.ndarray[int]:
+def get_combined_die(dice: dict[int, int]) -> np.ndarray[int]:
     """
     :param dice: dictionary of 'sides', 'number' pairs for kinds of dice
     :return: list where one-indexed index represents relative probability of getting that much damage
@@ -66,8 +67,6 @@ def damage_probabilities(expr, turn):
 def win_by(expr, n, t):
     if t >= n:
         return 1
-    if t == 0:
-        return 0
     return sum(damage_probabilities(expr, t).all_coeffs()[:-n])
 
 
@@ -75,43 +74,39 @@ def win_on(expr, n, t):
     return win_by(expr, n, t) - win_by(expr, n, t - 1)
 
 
-def binomial_distribution(n, p):
-    """Generates binomial distribution for N=0 to N=N"""
+def binomial_distribution(n, p, enum=False):
+    """Generates binomial distribution for N=1 to N=N"""
     v = (1 - p) ** n
     mod = p / (1 - p)
-    yield v
     for i in range(0, n):
         v *= mod
         v *= n - i
         v /= i + 1
-        yield v
+        if enum:
+            yield i, v
+        else:
+            yield v
 
 
 @functools.cache
 def win_by_can_miss(p: Player, hp: int, turns: int):
     if p.hit_chance == 1:
         return win_by(p.expr, hp, turns)
-    elif hp >= turns:
-        return sum(win_by(p.expr, hp, t) * binom for t, binom in
-                   zip(range(turns + 1), binomial_distribution(turns, p.hit_chance)))
-    left_binom = 1
-    total_win = 0
-    for t, binom in zip(range(hp + 1), binomial_distribution(turns, p.hit_chance)):
-        left_binom -= binom
-        total_win += win_by(p.expr, hp, t) * binom
-    print(total_win, left_binom, total_win + left_binom)
-    return total_win + left_binom
+    else:
+        return sum(win_by(p.expr, hp, t) * binom for t, binom in binomial_distribution(turns, p.hit_chance, enum=True))
+
+
+def win_on_can_miss(p: Player, hp: int, turns: int):
+    return win_by(p, hp, turns) - win_by(p, hp, turns - 1)
 
 
 def win_chances(a: Player, b: Player, turns: 'int | None' = None):
     """
     Given two players, returns chances of the first player winning, the second player winning,
-    or a draw (simultaneous elimination or no elimination).
+    or a draw (simultaneous elimination).
     """
-    ex = True
+    ex = False
     min_turns = min((b.hp - 1) // a.expr.degree(x), (a.hp - 1) // b.expr.degree(x)) + 1
-    if turns < min_turns:
-        return 0, 0, 1
     if a.hit_chance == b.hit_chance == 1:
         # case: all attacks hit
         # we can get exact numbers just by simulating up to min(a.hp, b.hp) + 1 turns,
@@ -161,61 +156,16 @@ def win_chances_initiative(a: Player, b: Player, turns: int):
     return a_w + ipa * d, b_w + ipb * d
 
 
-def expected_var(p: Player, hp: int, turns: int | None = None):
-    min_turns = (hp - 1) // p.expr.degree(x) + 1
-    ex = True
-    if p.hit_chance == 1:
-        turns = hp + 1
-        wins_by = np.fromiter((win_by(p.expr, hp, t) for t in range(min_turns, turns)),
-                              sympy.Rational if ex else float, turns - min_turns)
-    elif turns is None:
-        raise ValueError('turns must be provided when hit chances are not 1')
-    else:
-        wins_by = np.fromiter((win_by_can_miss(p, hp, t) for t in range(min_turns, turns)),
-                              sympy.Rational if ex else float, turns - min_turns)
-
-    wins = np.ediff1d(wins_by, to_begin=wins_by[0])
-    exp = np.arange(min_turns, turns) * wins
-    return np.sum(exp), np.sum(exp * wins)
-
-
-def main():
-    player_dice = ({2: 1}, {4: 1}, {6: 1}, {4: 2}, {6: 2}, {10: 1}, {6: 1, 1: 3})
-    players = (Player.from_coeffs(1, get_combined_dice(dice), 1, 1) for dice in player_dice)
-
-    start = time.perf_counter_ns()
-    print('Players\n')
-    for i, dice in enumerate(player_dice, 1):
-        print(f'Player {i} dice: {dice}')
-    for i, p in enumerate(players, 1):
-        print(f'\nPlayer {i}')
-        for hp in (10, 20, 30, 40, 50, 60, 100):
-            exp, var = expected_var(p, hp)
-            print(f'{hp} HP: E: {float(exp)}, V: {float(var)}')
-    end = time.perf_counter_ns()
-    print(end - start)
-
-    start = time.perf_counter_ns()
-
-    end = time.perf_counter_ns()
-    print(end - start)
-
-    """
-    p0 = Player.from_coeffs(12, (1, 1), sympy.Rational(1, 2), 50)
-    p1 = Player.from_coeffs(13, (1,), sympy.Rational(1, 2), 50)
+if __name__ == '__main__':
+    p0 = Player.from_coeffs(12, (1,), 0.5, 50)
+    p1 = Player.from_coeffs(13, (1,), 0.5, 50)
 
     # r = win_chances_initiative(p0, p1, 20)
-    print(win_by(p0.expr, 10, 7))
-    start = time.perf_counter_ns()
-    r = win_chances(p0, p1, 100)
-    end = time.perf_counter_ns()
-    print(end - start)
+    s = time.perf_counter_ns()
+    r = win_chances(p0, p1, 2000)
+    e = time.perf_counter_ns()
+    print(e - s)
     print(r)
     print(*(float(a) for a in r))
-    print(err := 1 - sum(r))  # error
-    print(float(err))
-    """
+    print(1 - sum(r))  # error
 
-
-if __name__ == '__main__':
-    main()
