@@ -196,6 +196,9 @@ def expected_var(p: Player, hp: int, turns: int | None = None, exact: bool = Tru
     return np.sum(exp), np.sum(exp * wins)  # type: ignore
 
 
+# below these are some code that was run for testing
+
+
 def test_battle_mul():
     combatants = [
         Player.from_coeffs(10, get_combined_dice({4: 1}), sympy.Rational(1, 2), 0),
@@ -215,6 +218,12 @@ def test_battle_mul():
 6: 18+2d6+2d8+2d10, 172 hp, 82.5%, 0
 ''')
 
+    start = time.perf_counter_ns()
+    for p in combatants:
+        print(expected_var(p, 100, 200)[1].evalf())
+    end = time.perf_counter_ns()
+
+    print(end - start)
     start = time.perf_counter_ns()
     for i, a in enumerate(combatants, 1):
         for j, b in enumerate(combatants, 1):
