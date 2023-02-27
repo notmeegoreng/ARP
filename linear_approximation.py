@@ -1,7 +1,12 @@
+from __future__ import annotations
+
 import numpy as np
 
 
-def linear_approximation(damage: list) -> tuple[float, float]:
+__all__ = ('linear_approximation', 'linear_predict')
+
+
+def linear_approximation(damage: list | np.ndarray) -> tuple[float, float]:
     """
     :param damage: a list of relative chances of dealing damage equal to the index (one-indexed)
     :return: (m, c) tuple for use in the equation y = mx + c, where y is E(X) and x is HP.
@@ -12,7 +17,14 @@ def linear_approximation(damage: list) -> tuple[float, float]:
     coeffs[0] = s
     # the expected damage each turn
     expected_damage_mul_s = np.sum(np.arange(1, len(damage) + 1) * damage)
-    return expected_damage_mul_s / s, np.sum(coeffs * np.arange(len(damage))) / expected_damage_mul_s
+    m = s / expected_damage_mul_s
+    return m, np.sum(coeffs * np.arange(len(damage))) / expected_damage_mul_s * m
+
+
+def linear_predict(damage: list | np.ndarray, hp: int):
+    """Finds the approximated expected turns to defeat enemy"""
+    m, c = linear_approximation(damage)
+    return m * hp + c
 
 
 if __name__ == '__main__':

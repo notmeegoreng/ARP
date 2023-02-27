@@ -2,6 +2,9 @@ import sympy
 
 import main
 
+
+__all__ = ('recurrence_solve',)
+
 y = sympy.Function('y')
 x = sympy.symbols('x', integer=True)
 
