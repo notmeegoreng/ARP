@@ -5,11 +5,11 @@ import functools
 import time
 from collections.abc import Sequence, Iterator
 
-import numpy
 import numpy as np
 import sympy
 
 x = sympy.symbols('x')
+
 
 """
 Optimise to not need to calc the rest of the binomial series when the number of hits 
@@ -54,7 +54,7 @@ cache = {}
 
 
 def damage_probabilities(expr: sympy.Poly, hits: int) -> sympy.Poly:
-    # hits should not be <= 0
+    # turn should not be <= 0
     if expr not in cache:
         cache[expr] = [expr]
     for _ in range(len(cache[expr]), hits):
@@ -75,24 +75,16 @@ def win_on(expr: sympy.Poly, n: int, t: int) -> sympy.Rational | int:
     return win_by(expr, n, t) - win_by(expr, n, t - 1)
 
 
-def binomial_distribution(n: int, p: sympy.Rational, s: int = 0, e: int | None = None) -> Iterator[sympy.Rational]:
-    """Generates binomial distribution with n trials with successes ranging from s (default 0) to e (default n)"""
-    if e is None:
-        e = n
-    v = (1 - p) ** (n - s) * p ** s
-    if s != 0:
-        for i in range(s + 1, n + 1):
-            v *= i
-            v /= i - s
+def binomial_distribution(n: int, p: sympy.Rational) -> Iterator[sympy.Rational]:
+    """Generates binomial distribution for N=0 to N=N"""
+    v = (1 - p) ** n
     mod = p / (1 - p)
     yield v
-    for i in range(s, min(n, e)):
+    for i in range(0, n):
         v *= mod
         v *= n - i
         v /= i + 1
         yield v
-    for _ in range(n, e):
-        yield 0
 
 
 @functools.cache
@@ -117,9 +109,13 @@ def win_by_can_miss(p: Player, hp: int, turns: int) -> sympy.Rational | int:
     return total_win + left_binom
 
 
-def win_arrays(a: Player, b: Player, turns: int | None = None,
-               exact: bool = True) -> tuple[sympy.Rational, sympy.Rational, sympy.Rational] | \
-                                      tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]:
+def win_chances(a: Player, b: Player, turns: int | None = None, exact: bool = True
+                ) -> tuple[sympy.Rational, sympy.Rational, sympy.Rational]:
+    """
+    Given two players, returns chances of the first player winning, the second player winning,
+    or a draw (simultaneous elimination or no elimination).
+    """
+
     min_turns = min((b.hp - 1) // a.expr.degree(x), (a.hp - 1) // b.expr.degree(x)) + 1
     if turns < min_turns:
         return sympy.Rational(0, 1), sympy.Rational(0, 1), sympy.Rational(1, 1)
@@ -133,7 +129,7 @@ def win_arrays(a: Player, b: Player, turns: int | None = None,
         b_wins_by = np.fromiter((win_by(b.expr, a.hp, t) for t in range(min_turns, max_turns)),
                                 sympy.Rational if exact else float, max_turns - min_turns)
     elif turns is None:
-        raise ValueError('turns must be provided when hit chances are not 1!')
+        raise ValueError('turns must be provided when hit chances are not 1')
     else:
         # when attacks have a hit chance, the battle could theoretically go on forever
         # we calculate up to a given number of turns
@@ -148,17 +144,9 @@ def win_arrays(a: Player, b: Player, turns: int | None = None,
     # chance of a player winning each turn:
     # chance they defeat other on that turn * chance that they have not been defeated
     # chance of simultaneous elimination each turn: chance each defeats other multiplied together
-    return a_wins * (1 - b_wins_by), b_wins * (1 - a_wins_by), a_wins * b_wins
-
-
-def win_chances(a: Player, b: Player, turns: int | None = None,
-                exact: bool = True) -> tuple[sympy.Rational, sympy.Rational, sympy.Rational]:
-    """
-    Given two players, returns chances of the first player winning, the second player winning,
-    or a draw (simultaneous elimination or no elimination).
-    """
-    a, b, d = win_arrays(a, b, turns, exact)
-    return np.sum(a), np.sum(b), np.sum(d)  # type: ignore
+    return (np.sum(a_wins * (1 - b_wins_by)),  # type: ignore
+            np.sum(b_wins * (1 - a_wins_by)),
+            np.sum(a_wins * b_wins))
 
 
 def win_chances_initiative(a: Player, b: Player, turns: int) -> tuple[sympy.Rational, sympy.Rational]:
@@ -187,102 +175,6 @@ def win_chances_initiative(a: Player, b: Player, turns: int) -> tuple[sympy.Rati
     # first to attack wins in case of simultaneous elimination
     a_w, b_w, d = win_chances(a, b, turns)
     return a_w + ipa * d, b_w + ipb * d
-
-
-def clamp_length(dmg, length):
-    if len(dmg) < length:
-        return np.pad(dmg, (0, length - len(dmg)))
-    elif len(dmg) > length:
-        excess = np.sum(dmg[length:])
-        dmg = dmg[:length]
-        dmg[-1] += excess
-        return dmg
-    return dmg
-
-
-def battle_outcomes(p_a: Player, p_b: Player, turns: int | None = None):
-    """
-    Takes in 2 player objects, and returns 2 arrays representing the chances
-    of taking damage equal to the index for each player respectively.
-    The last index represents the chance of losing: taking damage at least equal to their HP.
-    """
-    a_min_h, b_min_h = (p_b.hp - 1) // p_a.expr.degree(x) + 1, (p_a.hp - 1) // p_b.expr.degree(x) + 1
-    a_max_h, b_max_h = p_b.hp + 1, p_a.hp + 1
-    min_h = min(a_min_h, b_min_h)
-    max_h = max(a_max_h, b_max_h)
-    a_damage_rows_h = np.row_stack([
-        clamp_length(np.flip(damage_probabilities(p_a.expr, i).all_coeffs()), p_b.hp + 1)
-        for i in range(min_h, max_h)
-    ])
-    b_damage_rows_h = np.row_stack([
-        clamp_length(np.flip(damage_probabilities(p_b.expr, i).all_coeffs()), p_a.hp + 1)
-        for i in range(min_h, max_h)
-    ])
-    if turns is None and (p_a.hit_chance != p_b.hit_chance != 1):
-        raise ValueError('turns must be provided when hit chances are not 1!')
-    if turns < max_h:
-        raise ValueError('turns too low, failing for accuracy and code simplification')
-    print(min_h, max_h)
-    if p_a.hit_chance == 1:
-        # hits = turns
-        if p_b.hit_chance == 1:
-            a_damage_rows = a_damage_rows_h
-        else:
-            a_damage_rows = np.row_stack((
-                a_damage_rows_h,
-                np.zeros((turns - min_h - a_damage_rows_h.shape[0], p_b.hp + 1), dtype=object)
-            ))
-    else:
-        a_damage_rows = np.empty((turns - min_h, p_b.hp + 1), dtype=sympy.Rational)
-        for n in range(min_h, turns):
-            a_hit_chances = np.fromiter(
-                binomial_distribution(n, p_a.hit_chance, min_h, max_h), sympy.Rational, count=max_h - min_h)
-            # print(n)
-            # print(a_hit_chances)
-            a_damage_rows[n - min_h] = np.sum(a_hit_chances[:, np.newaxis] * a_damage_rows_h, axis=0)
-    print('A')
-    print(a_damage_rows.shape)
-    print(a_damage_rows)
-
-    if p_b.hit_chance == 1:
-        if p_a.hit_chance == 1:
-            b_damage_rows = b_damage_rows_h
-        else:
-            b_damage_rows = np.row_stack((
-                b_damage_rows_h,
-                np.zeros((turns - min_h - b_damage_rows_h.shape[0], p_a.hp + 1), dtype=object)
-            ))
-    else:
-        b_damage_rows = np.empty((turns - min_h, p_a.hp + 1), dtype=sympy.Rational)
-        for n in range(min_h, turns):
-            print(n)
-            b_hit_chances = np.fromiter(
-                binomial_distribution(n, p_b.hit_chance, min_h, max_h), sympy.Rational, count=max_h - min_h)
-            print(b_hit_chances)
-            b_damage_rows[n - min_h] = np.sum(b_hit_chances[:, np.newaxis] * b_damage_rows_h, axis=0)
-    print('B')
-    print(b_damage_rows.shape)
-    print(b_damage_rows)
-
-    a_wins = np.ediff1d(a_damage_rows[:, -1], to_begin=a_damage_rows[0, -1])
-    b_wins = np.ediff1d(b_damage_rows[:, -1], to_begin=b_damage_rows[0, -1])
-    print('wins')
-    print(a_wins)
-    print(b_wins)
-    print('done')
-    return (
-        np.sum(a_wins[:, np.newaxis] * b_damage_rows, axis=0),
-        np.sum(b_wins[:, np.newaxis] * a_damage_rows, axis=0),
-    )
-
-
-a, b = battle_outcomes(
-    Player.from_coeffs(10, get_combined_dice({2: 1}), sympy.Rational(1, 1), 0),
-    Player.from_coeffs(20, get_combined_dice({2: 1}), sympy.Rational(1, 2), 0),
-    100
-)
-print(a.astype(float))
-print(b.astype(float))
 
 
 def expected_var(p: Player, hp: int, turns: int | None = None, exact: bool = True
