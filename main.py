@@ -167,3 +167,40 @@ def win_arrays(p0: Player, p1: Player, turns: int) -> tuple[np.ndarray, np.ndarr
     # chance they defeat other on that turn * chance that they have not been defeated
     # chance of simultaneous elimination each turn: chance each defeats other multiplied together
     return wins0 * (1 - wins_by1), wins1 * (1 - wins_by0), wins0 * wins1
+
+
+def win_chances(p0: Player, p1: Player, turns: int,) -> tuple[gmpy2.mpq, gmpy2.mpq, gmpy2.mpq]:
+    """
+    Given two players, returns chances of the first player winning, the second player winning,
+    or a draw (simultaneous elimination or no elimination).
+    """
+    w0, w1, d = win_arrays(p0, p1, turns)
+    return np.sum(w0), np.sum(w1), np.sum(d)  # type: ignore
+
+
+def win_chances_initiative(a: Player, b: Player, turns: int) -> tuple[gmpy2.mpq, gmpy2.mpq]:
+    # initiative calc
+    diff = a.initiative_mod - b.initiative_mod
+    # ip: initiative probability
+    # how it works: each roll a d20, then add their initiative_mod
+    # if equal, roll again
+    # this can be modelled as chances of the difference between d20s being less than the difference in modifiers
+    # difference between 2 independent d20s is a pyramid with linear sides, peak at 0
+    if diff >= 20:
+        ipa = 1
+        ipb = 0
+    elif diff <= -20:
+        ipa = 0
+        ipb = 1
+    elif diff > 0:
+        # calc chance of Player a winning and normalise to 1, since ignoring equal case
+        # calc: (20 - d)(19 - d)/800 * (380 + d)/400 where d is absolute difference
+        ipb = gmpy2.mpq((20 - diff) * (19 - diff), 380 + diff) / 2
+        ipa = 1 - ipb
+    else:
+        ipa = gmpy2.mpq((20 + diff) * (19 + diff), 380 - diff) / 2
+        ipb = 1 - ipa
+
+    # first to attack wins in case of simultaneous elimination
+    a_w, b_w, d = win_chances(a, b, turns)
+    return a_w + ipa * d, b_w + ipb * d
