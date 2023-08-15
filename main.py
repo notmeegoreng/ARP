@@ -133,7 +133,7 @@ def split_with_choices(choices: Sequence[Attack], enemy_hp: int, turns_remaining
 
     poly = choices[enemy_hp].poly
     chance = np.sum(poly * np.fromiter(
-        (_split(choices, hp, turns_remaining - 1) for hp in range(enemy_hp, enemy_hp - len(poly) - 1, -1)),
+        (split_with_choices(choices, hp, turns_remaining - 1) for hp in range(enemy_hp, enemy_hp - len(poly) - 1, -1)),
         gmpy2.mpq, len(poly)
     ))
     split_cache[(c_hash, enemy_hp, turns_remaining)] = chance
@@ -156,12 +156,12 @@ def win_array(p: Player, enemy_hp: int, max_turns: int):
 
 
 def win_arrays(p0: Player, p1: Player, turns: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    wins0 = win_array(p0, p1.hp, turns)
-    wins1 = win_array(p1, p0.hp, turns)
+    wins_by0 = win_array(p0, p1.hp, turns)
+    wins_by1 = win_array(p1, p0.hp, turns)
 
-    # chance of winning on by a turn = chance on winning in previous turns + chance of winning on turn
-    wins_by0 = np.cumsum(wins0)
-    wins_by1 = np.cumsum(wins1, to_begin=wins1[0])
+    # chance of winning on turn n = chance of winning by turn n - chance of winning by turn n-1
+    wins0 = np.ediff1d(wins_by0, to_begin=wins_by0[0])
+    wins1 = np.ediff1d(wins_by1, to_begin=wins_by1[0])
 
     # chance of a player winning each turn:
     # chance they defeat other on that turn * chance that they have not been defeated
