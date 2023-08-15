@@ -1,304 +1,491 @@
-from __future__ import annotations
-
 import dataclasses
-import functools
-import time
-from collections.abc import Sequence, Iterator
+import itertools
+from collections.abc import Iterator, Sequence
 
-import numpy
+import gmpy2
 import numpy as np
-import sympy
 
-x = sympy.symbols('x')
+gmpy2.get_context().rational_division = True
 
-"""
-Optimise to not need to calc the rest of the binomial series when the number of hits 
-ensures that chance to kill is 1
-"""
+
+def poly_mul(poly0: np.ndarray, poly1: np.ndarray) -> np.ndarray:
+    """
+    Takes in two vectors representing polynomials and return a vector representing their multiplication.
+    One of the vectors can be a matrix, which would be considered as an array of polynomials.
+    A matrix representing an array of output polynomials is returned.
+
+    converting polynomial multiplication to matrix
+    credit https://www.le.ac.uk/users/dsgp1/COURSES/THIRDMET/MYLECTURES/9XMATRIPOL.pdf
+    fast rolling to construct the matrix required
+    credit https://stackoverflow.com/a/42101326
+    """
+    if len(poly0.shape) > 1:
+        if len(poly1.shape) > 1:
+            raise ValueError('Multiple multidimensional arguments not supported!')
+        poly0, poly1 = poly1, poly0
+    if len(poly0) == 1 or poly1.shape[-1] == 1:
+        return poly0 * poly1
+    le = poly1.shape[-1]
+    mat = np.repeat(np.pad(poly0, (0, le - 1))[np.newaxis, :], le, axis=0)
+    m, n = mat.shape
+    idx = np.mod((n - 1) * np.arange(m)[:, np.newaxis] + np.arange(n), n)
+    out = poly1 @ mat[np.arange(m)[:, np.newaxis], idx]
+    return out
+
+
+def poly_pow(poly: np.ndarray, n: int) -> np.ndarray:
+    r = poly
+    n -= 1
+    while True:
+        n, m = n // 2, n
+
+        if m & 1:
+            r = poly_mul(poly, r)
+
+        if not n:
+            break
+
+        r = poly_mul(r, r)
+    return r
+
+
+@dataclasses.dataclass(frozen=True)
+class Attack:
+    poly: np.ndarray
+
+    @classmethod
+    def from_dice(cls, dice: dict[int, int], hit_chance: gmpy2.mpq):
+        total = np.ones(1, dtype=gmpy2.mpq)
+        for sides, n in dice.items():
+            # mul the pgf of this dice type
+            dice = np.ones(sides + 1, dtype=gmpy2.mpq)
+            dice[0] = 0
+            total = poly_mul(poly_pow(dice, n), total)
+        total *= hit_chance / total.sum()
+        total[0] = 1 - hit_chance
+        return cls(total)
+
+    def expected_dmg(self):
+        return (self.poly * np.arange(len(self.poly))).sum()
+
+    def max_dmg(self):
+        return len(self.poly) - 1
+
+    def __hash__(self):
+        return hash((self.poly.tobytes()))
 
 
 @dataclasses.dataclass(frozen=True)
 class Player:
     hp: int
-    expr: sympy.Poly
-    hit_chance: sympy.Rational
+    attacks: dict[Attack, int]
     initiative_mod: int
 
-    @classmethod
-    def from_coeffs(cls, hp, coeffs, hit_chance, initiative_mod) -> 'Player':
-        return cls(hp, to_expr(coeffs), hit_chance, initiative_mod)
+    def __post_init__(self):
+        # sort attacks by expected damage
+        object.__setattr__(
+            self, 'attacks',
+            dict(sorted(self.attacks.items(), key=lambda item: item[0].expected_dmg(), reverse=True)))
 
 
-def get_combined_dice(dice: dict[int, int]) -> list[int]:
-    """
-    :param dice: dictionary of 'sides', 'number' pairs for kinds of dice
-    :return: list where one-indexed index represents relative probability of getting that much damage
-    """
-    total = 1  # total pgf
-    for sides, n in dice.items():
-        # mul the pgf of this dice type
-        total *= sum(x ** i for i in range(1, sides + 1)) ** n
-
-    # sympy returns coeffs with the highest power first
-    # get coeffs starting with low powers first, and remove the coeff of x^0 (which will be 0)
-    coefficients = sympy.Poly(total).all_coeffs()[-2::-1]
-    return coefficients
+damage_cache = {}
 
 
-def to_expr(coefficients: Sequence[int]) -> sympy.Poly:
-    s = sum(coefficients)
-    return sympy.Poly(sympy.Rational(1, s) * sum(c * x ** i for i, c in enumerate(coefficients, 1)))
-
-
-cache = {}
-
-
-def damage_probabilities(expr: sympy.Poly, hits: int) -> sympy.Poly:
-    # hits should not be <= 0
-    if expr not in cache:
-        cache[expr] = [expr]
-    for _ in range(len(cache[expr]), hits):
-        cache[expr].append(cache[expr][-1] * expr)
-    return cache[expr][hits - 1]
-
-
-@functools.cache
-def win_by(expr: sympy.Poly, n: int, hits: int) -> sympy.Rational | int:
-    if hits >= n:
-        return 1
+def damage_probabilities(base: np.ndarray, hits: int) -> np.ndarray:
+    if hits < 0:
+        raise ValueError('hits >= 0!')
     if hits == 0:
-        return 0
-    return sum(damage_probabilities(expr, hits).all_coeffs()[:-n])
+        return np.ones(1, dtype=gmpy2.mpq)
+    h = hash(base.tobytes())
+    if h not in damage_cache:
+        damage_cache[h] = [base]
+    for _ in range(len(damage_cache[h]), hits):
+        damage_cache[h].append(poly_mul(damage_cache[h][-1], base))
+    return damage_cache[h][hits - 1]
 
 
-def win_on(expr: sympy.Poly, n: int, t: int) -> sympy.Rational | int:
-    return win_by(expr, n, t) - win_by(expr, n, t - 1)
+def win_by(poly: np.ndarray, n: int) -> gmpy2.mpq:
+    if len(poly) == 1:
+        return gmpy2.mpq()
+    return poly[n:].sum()
 
 
-def binomial_distribution(n: int, p: sympy.Rational, s: int = 0, e: int | None = None) -> Iterator[sympy.Rational]:
-    """Generates binomial distribution with n trials with successes ranging from s (default 0) to e (default n)"""
-    if e is None:
-        e = n
-    v = (1 - p) ** (n - s) * p ** s
-    if s != 0:
-        for i in range(s + 1, n + 1):
-            v *= i
-            v /= i - s
-    mod = p / (1 - p)
-    yield v
-    for i in range(s, min(n, e)):
-        v *= mod
-        v *= n - i
-        v /= i + 1
-        yield v
-    for _ in range(n, e):
-        yield 0
+def win_on(poly: np.ndarray, n: int, t: int) -> gmpy2.mpq:
+    return win_by(damage_probabilities(poly, t), n) - win_by(damage_probabilities(poly, t - 1), n)
 
 
-@functools.cache
-def win_by_can_miss(p: Player, hp: int, turns: int) -> sympy.Rational | int:
-    if p.hit_chance == 1:
-        return win_by(p.expr, hp, turns)
+def get_attacks_greedy(p: Player, turns: int) -> dict[Attack, int]:
+    # greedy algo
+    result = {}
+    for att, uses in p.attacks.items():
+        if uses == 0 or turns <= uses:
+            result[att] = turns
+            return result
+        else:
+            result[att] = uses
+            turns -= uses
 
-    # sum the binomial probability of hitting some number of times * chance of winning by that number of hits
-    # once enough hits that its enough to confirm win, the second term above will always be 1 for rest of terms
-    # just sum the rest of the binomial probability
-    # (taking advantage of fact that binomial probability sums to 1)
-    left_binom = 1
-    total_win = 0
-    t = 0
-    for binom in binomial_distribution(turns, p.hit_chance):
-        w_b = win_by(p.expr, hp, t)
-        if w_b == 1:
-            break
-        left_binom -= binom
-        total_win += w_b * binom
-        t += 1
-    return total_win + left_binom
+    raise ValueError('Not enough attacks to use for that many turns!')
 
 
-def win_arrays(a: Player, b: Player, turns: int | None = None,
-               exact: bool = True) -> tuple[sympy.Rational, sympy.Rational, sympy.Rational] | \
-                                      tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]:
-    min_turns = min((b.hp - 1) // a.expr.degree(x), (a.hp - 1) // b.expr.degree(x)) + 1
-    if turns < min_turns:
-        return sympy.Rational(0, 1), sympy.Rational(0, 1), sympy.Rational(1, 1)
-    if a.hit_chance == b.hit_chance == 1:
-        # case: all attacks hit
-        # we can get exact numbers just by simulating up to min(a.hp, b.hp) + 1 turns,
-        # when the fight is guaranteed to be over
-        max_turns = min(a.hp, b.hp) + 1
-        a_wins_by = np.fromiter((win_by(a.expr, b.hp, t) for t in range(min_turns, max_turns)),
-                                sympy.Rational if exact else float, max_turns - min_turns)
-        b_wins_by = np.fromiter((win_by(b.expr, a.hp, t) for t in range(min_turns, max_turns)),
-                                sympy.Rational if exact else float, max_turns - min_turns)
-    elif turns is None:
-        raise ValueError('turns must be provided when hit chances are not 1!')
+def get_attacks(p: Player, enemy_hp: int, turns: int) -> Iterator[Attack | None]:
+    # greedy algo
+    for att, uses in p.attacks.items():
+        if turns <= uses:
+            enemy_hp // att.max_dmg()
+            for _ in range(uses):
+                yield att
+            if turns == uses:
+                return
+            turns -= uses
+        else:
+            for _ in range(turns):
+                yield att
+            return
+    raise ValueError('Not enough attacks to use for that many turns!')
+
+
+def combine_attacks(attacks: dict[Attack, int]) -> np.ndarray:
+    poly = np.ones(1, dtype=gmpy2.mpq)
+    for attack, times in attacks.items():
+        poly = poly_mul(poly, damage_probabilities(attack.poly, times))
+    return poly
+
+
+def win_by_attacks(attacks: dict[Attack, int], hp: int):
+    return win_by(combine_attacks(attacks), hp)
+
+
+def get_min_turns(p: Player, hp: int):
+    turns = 0
+    for att, uses in p.attacks.items():
+        max_dmg = len(att.poly)
+        if uses != 0 and max_dmg * uses <= hp:
+            turns += uses
+            hp -= max_dmg * uses
+            if hp == 0:
+                return turns
+        else:
+            return turns + (hp - 1) // max_dmg + 1
+
+
+def win_by_array(attacks: dict[Attack, int], enemy_hp: int, max_turns: int | None = None, *,
+                 initial: np.ndarray | None = None) -> np.ndarray:
+    if initial is None:
+        poly = np.ones(1, dtype=gmpy2.mpq)
     else:
-        # when attacks have a hit chance, the battle could theoretically go on forever
-        # we calculate up to a given number of turns
-        a_wins_by = np.fromiter((win_by_can_miss(a, b.hp, t) for t in range(min_turns, turns)),
-                                sympy.Rational if exact else float, turns - min_turns)
-        b_wins_by = np.fromiter((win_by_can_miss(b, a.hp, t) for t in range(min_turns, turns)),
-                                sympy.Rational if exact else float, turns - min_turns)
+        poly = initial
+
+    # when attacks have a hit chance, the battle could theoretically go on forever
+    # we calculate up to a given number of turns
+    wins_by = np.empty(max_turns or sum(attacks.values()), dtype=gmpy2.mpq)
+    t = 0
+    for att, count in attacks.items():
+        for _ in range(count):
+            poly = poly_mul(poly, att.poly)
+            wins_by[t] = win_by(poly, enemy_hp)
+            t += 1
+    return wins_by
+
+
+def win_arrays(p0: Player, p1: Player, turns: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    min_turns = min(get_min_turns(p0, p1.hp), get_min_turns(p1, p0.hp))
+    if turns < min_turns:
+        raise ValueError('Not enough turns - confirmed draw')
+
+    wins_by0 = win_by_array(get_attacks_greedy(p0, turns), p1.hp, turns)
+    wins_by1 = win_by_array(get_attacks_greedy(p1, turns), p0.hp, turns)
+
     # chance of winning on turn n = chance of winning by turn n - chance of winning by turn n-1
-    a_wins = np.ediff1d(a_wins_by, to_begin=a_wins_by[0])
-    b_wins = np.ediff1d(b_wins_by, to_begin=b_wins_by[0])
+    wins0 = np.ediff1d(wins_by0, to_begin=wins_by0[0])
+    wins1 = np.ediff1d(wins_by1, to_begin=wins_by1[0])
 
     # chance of a player winning each turn:
     # chance they defeat other on that turn * chance that they have not been defeated
     # chance of simultaneous elimination each turn: chance each defeats other multiplied together
-    return a_wins * (1 - b_wins_by), b_wins * (1 - a_wins_by), a_wins * b_wins
+    return wins0 * (1 - wins_by1), wins1 * (1 - wins_by0), wins0 * wins1
 
 
-def win_chances(a: Player, b: Player, turns: int | None = None,
-                exact: bool = True) -> tuple[sympy.Rational, sympy.Rational, sympy.Rational]:
-    """
-    Given two players, returns chances of the first player winning, the second player winning,
-    or a draw (simultaneous elimination or no elimination).
-    """
-    a, b, d = win_arrays(a, b, turns, exact)
-    return np.sum(a), np.sum(b), np.sum(d)  # type: ignore
+def all_win_arrays(
+        initial: np.ndarray, enemy_hp: int,
+        attacks_remaining: dict[Attack, int], turns_remaining: int) -> list[tuple[dict[Attack, int], np.ndarray]]:
+    num_attacks_left = sum(attacks_remaining.values())
+    if num_attacks_left < turns_remaining:
+        raise ValueError('not enough attacks')
+    elif num_attacks_left == turns_remaining:
+        return [(attacks_remaining, win_by_array(attacks_remaining, enemy_hp, turns_remaining, initial=initial))]
+    arrays = []
+    for product in itertools.product(*(
+            range(uses) if uses else range(turns_remaining) for uses in attacks_remaining.values()
+    )):
+        if sum(product) == turns_remaining:
+            attacks = dict(zip(attacks_remaining.keys(), product))
+            win = win_by_array(attacks, enemy_hp, turns_remaining)
+            # sort out superseded
+            for array in arrays[:]:
+                if (array <= win).all():
+                    arrays.remove(array)
+                    print('c0')
+                elif (array >= win).all():
+                    print('c1')
+                    break
+            else:  # no break
+                arrays.append((attacks, win))
+    return arrays
 
 
-def win_chances_initiative(a: Player, b: Player, turns: int) -> tuple[sympy.Rational, sympy.Rational]:
-    # initiative calc
-    diff = a.initiative_mod - b.initiative_mod
-    # ip: initiative probability
-    # how it works: each roll a d20, then add their initiative_mod
-    # if equal, roll again
-    # this can be modelled as chances of the difference between d20s being less than the difference in modifiers
-    # difference between 2 independent d20s is a pyramid with linear sides, peak at 0
-    if diff >= 20:
-        ipa = 1
-        ipb = 0
-    elif diff <= -20:
-        ipa = 0
-        ipb = 1
-    elif diff > 0:
-        # calc chance of Player a winning and normalise to 1, since ignoring equal case
-        # calc: (20 - d)(19 - d)/800 * (380 + d)/400 where d is absolute difference
-        ipb = sympy.Rational((20 - diff) * (19 - diff), 380 + diff) / 2
-        ipa = 1 - ipb
-    else:
-        ipa = sympy.Rational((20 + diff) * (19 + diff), 380 - diff) / 2
-        ipb = 1 - ipa
-
-    # first to attack wins in case of simultaneous elimination
-    a_w, b_w, d = win_chances(a, b, turns)
-    return a_w + ipa * d, b_w + ipb * d
+def greedy_until_hp(p: Player) -> int | None:
+    """What enemy HP we can use greedy algorithm until"""
+    if len(p.attacks) == 1:
+        return None
+    if len(p.attacks) == 2:
+        atts = iter(p.attacks.keys())
+        return next(atts).max_dmg() * next(atts).max_dmg()
 
 
-def clamp_length(dmg, length):
+def greedy_until(p: Player, enemy_hp: int) -> dict[Attack, int] | None:
+    min_hp = greedy_until_hp(p)
+    if min_hp is None:
+        return None
+    if min_hp < enemy_hp:
+        return {}
+    enemy_hp -= min_hp
+    result = {}
+    for att, uses in p.attacks.items():
+        dmg = att.max_dmg()
+        if uses != 0 and enemy_hp // dmg >= uses:
+            enemy_hp -= dmg * uses
+            result[att] = uses
+            if not enemy_hp:
+                return result
+        else:
+            result[att] = (enemy_hp - 1) // dmg + 1
+            return result
+    return result
+
+
+def exhaustive_single(p: Player, enemy_hp: int, turns: int) -> list[tuple[dict[Attack, int], np.ndarray]]:
+    initial_attacks = greedy_until(p, enemy_hp)
+    if initial_attacks is None:
+        return [(atts := get_attacks_greedy(p, turns), win_by_array(atts, enemy_hp, turns))]
+
+    initial = combine_attacks(initial_attacks)
+    attacks_remaining = {att: uses - used for (att, uses), used in zip(p.attacks.items(), initial_attacks.values())}
+    return all_win_arrays(initial, enemy_hp, attacks_remaining, sum(attacks_remaining.values()))
+
+
+def win_compare(w0: np.ndarray | None, w1: np.ndarray) -> bool:
+    """True if w1 is considered larger, otherwise false"""
+    if w0 is None:
+        return True
+    for c0, c1 in zip(w0, w1):
+        if c0 < c1:
+            return True
+        elif c0 > c1:
+            return False
+
+
+def best_exhaustive_single(p: Player, enemy_hp: int, turns: int):
+    max_win = None
+    max_win_att = None
+    for attacks, win in exhaustive_single(p, enemy_hp, turns):
+        if win_compare(max_win, win):
+            max_win = win
+            max_win_att = attacks
+    return max_win_att
+
+
+def exhaustive(p0: Player, p1: Player, turns: int):
+    attacks0 = best_exhaustive_single(p0, p1.hp, turns)
+    attacks1 = best_exhaustive_single(p1, p0.hp, turns)
+    return attacks0, attacks1
+
+
+def fix_length(dmg: np.ndarray, length: int):
+    """Fixes the length of 1D arrays"""
     if len(dmg) < length:
         return np.pad(dmg, (0, length - len(dmg)))
     elif len(dmg) > length:
-        excess = np.sum(dmg[length:])
+        excess = dmg[length:].sum()
         dmg = dmg[:length]
         dmg[-1] += excess
         return dmg
     return dmg
 
 
-def battle_outcomes(p_a: Player, p_b: Player, turns: int | None = None):
+def fix_width(mat: np.ndarray, width: int) -> np.ndarray:
+    """Fixes the width of 2D arrays"""
+    curr = mat.shape[-1]
+    if curr < width:
+        return np.pad(mat, ((0, 0), (0, width - curr)))
+    elif curr > width:
+        excess = mat[:, width:].sum(axis=1)
+        mat = mat[:, :width]
+        mat[:, -1] += excess
+        return mat
+    return mat
+
+
+def attack_outcomes(attack: Attack, uses: int, width: int):
+    # omit first row of all zeros for eff
+    rows = [fix_length(attack.poly, width)]
+    for _ in range(uses - 1):
+        rows.append(fix_length(poly_mul(rows[-1], attack.poly), width))
+    return np.row_stack(rows)
+
+
+def battle_outcomes(hp0: int, attacks0: dict[Attack, int],
+                    hp1: int, attacks1: dict[Attack, int],
+                    limit0: int | None = None, limit1: int | None = None):
     """
     Takes in 2 player objects, and returns 2 arrays representing the chances
     of taking damage equal to the index for each player respectively.
     The last index represents the chance of losing: taking damage at least equal to their HP.
     """
-    a_min_h, b_min_h = (p_b.hp - 1) // p_a.expr.degree(x) + 1, (p_a.hp - 1) // p_b.expr.degree(x) + 1
-    a_max_h, b_max_h = p_b.hp + 1, p_a.hp + 1
-    min_h = min(a_min_h, b_min_h)
-    max_h = max(a_max_h, b_max_h)
-    a_damage_rows_h = np.row_stack([
-        clamp_length(np.flip(damage_probabilities(p_a.expr, i).all_coeffs()), p_b.hp + 1)
-        for i in range(min_h, max_h)
-    ])
-    b_damage_rows_h = np.row_stack([
-        clamp_length(np.flip(damage_probabilities(p_b.expr, i).all_coeffs()), p_a.hp + 1)
-        for i in range(min_h, max_h)
-    ])
-    if turns is None and (p_a.hit_chance != p_b.hit_chance != 1):
-        raise ValueError('turns must be provided when hit chances are not 1!')
-    if turns < max_h:
-        raise ValueError('turns too low, failing for accuracy and code simplification')
-    print(min_h, max_h)
-    if p_a.hit_chance == 1:
-        # hits = turns
-        if p_b.hit_chance == 1:
-            a_damage_rows = a_damage_rows_h
-        else:
-            a_damage_rows = np.row_stack((
-                a_damage_rows_h,
-                np.zeros((turns - min_h - a_damage_rows_h.shape[0], p_b.hp + 1), dtype=object)
-            ))
-    else:
-        a_damage_rows = np.empty((turns - min_h, p_b.hp + 1), dtype=sympy.Rational)
-        for n in range(min_h, turns):
-            a_hit_chances = np.fromiter(
-                binomial_distribution(n, p_a.hit_chance, min_h, max_h), sympy.Rational, count=max_h - min_h)
-            # print(n)
-            # print(a_hit_chances)
-            a_damage_rows[n - min_h] = np.sum(a_hit_chances[:, np.newaxis] * a_damage_rows_h, axis=0)
-    print('A')
-    print(a_damage_rows.shape)
-    print(a_damage_rows)
-
-    if p_b.hit_chance == 1:
-        if p_a.hit_chance == 1:
-            b_damage_rows = b_damage_rows_h
-        else:
-            b_damage_rows = np.row_stack((
-                b_damage_rows_h,
-                np.zeros((turns - min_h - b_damage_rows_h.shape[0], p_a.hp + 1), dtype=object)
-            ))
-    else:
-        b_damage_rows = np.empty((turns - min_h, p_a.hp + 1), dtype=sympy.Rational)
-        for n in range(min_h, turns):
-            print(n)
-            b_hit_chances = np.fromiter(
-                binomial_distribution(n, p_b.hit_chance, min_h, max_h), sympy.Rational, count=max_h - min_h)
-            print(b_hit_chances)
-            b_damage_rows[n - min_h] = np.sum(b_hit_chances[:, np.newaxis] * b_damage_rows_h, axis=0)
-    print('B')
-    print(b_damage_rows.shape)
-    print(b_damage_rows)
-
-    a_wins = np.ediff1d(a_damage_rows[:, -1], to_begin=a_damage_rows[0, -1])
-    b_wins = np.ediff1d(b_damage_rows[:, -1], to_begin=b_damage_rows[0, -1])
-    print('wins')
-    print(a_wins)
-    print(b_wins)
-    print('done')
+    all_damage_rows = []
+    wins = []
+    for e_h, attacks, limit in ((hp1, attacks0, limit0), (hp0, attacks1, limit1)):
+        e_h += 1
+        base = np.ones(1, dtype=gmpy2.mpq)
+        array_list = [np.zeros(e_h, dtype=gmpy2.mpq)]
+        for attack, times in attacks.items():
+            attack_mat = fix_width(poly_mul(q := attack_outcomes(attack, times, e_h), w := base), e_h)
+            print(q)
+            print(w)
+            print(attack_mat.shape)
+            array_list.append(attack_mat)
+            base = attack_mat[-1]
+        damage_rows = np.row_stack(array_list)
+        all_damage_rows.append(damage_rows)
+        wins.append(np.ediff1d(damage_rows[:, -1], to_begin=damage_rows[0, -1]))
+    print(wins)
+    print(wins[0].shape, wins[1].shape)
+    print(all_damage_rows[0])
+    print(all_damage_rows[1])
+    print(all_damage_rows[0].shape, all_damage_rows[1].shape)
+    print(type(all_damage_rows[1][-1, -1]))
     return (
-        np.sum(a_wins[:, np.newaxis] * b_damage_rows, axis=0),
-        np.sum(b_wins[:, np.newaxis] * a_damage_rows, axis=0),
+        np.sum(wins[0][:, np.newaxis] * all_damage_rows[1], axis=0),
+        np.sum(wins[1][:, np.newaxis] * all_damage_rows[0], axis=0),
     )
 
 
-a, b = battle_outcomes(
-    Player.from_coeffs(10, get_combined_dice({2: 1}), sympy.Rational(1, 1), 0),
-    Player.from_coeffs(20, get_combined_dice({2: 1}), sympy.Rational(1, 2), 0),
-    100
-)
-print(a.astype(float))
-print(b.astype(float))
+def win_chances(p0: Player, p1: Player, turns: int) -> tuple[gmpy2.mpq, gmpy2.mpq, gmpy2.mpq]:
+    """
+    Given two players, returns chances of the first player winning, the second player winning,
+    or a draw (simultaneous elimination or no elimination).
+    """
+    w0, w1, d = win_arrays(p0, p1, turns)
+    return np.sum(w0), np.sum(w1), np.sum(d)  # type: ignore
 
 
-def expected_var(p: Player, hp: int, turns: int | None = None, exact: bool = True
-                 ) -> tuple[sympy.Rational, sympy.Rational]:
-    min_turns = (hp - 1) // p.expr.degree(x) + 1
+def expected_var(p: Player, hp: int, turns: int) -> tuple[gmpy2.mpq, gmpy2.mpq]:
+    min_turns = get_min_turns(p, hp)
+    if min_turns > turns:
+        raise ValueError('Not enough turns - confirmed draw')
 
-    if p.hit_chance == 1:
-        turns = hp + 1
-        wins_by = np.fromiter((win_by(p.expr, hp, t) for t in range(min_turns, turns)),
-                              sympy.Rational if exact else float, turns - min_turns)
-    elif turns is None:
-        raise ValueError('turns must be provided when hit chances are not 1')
-    else:
-        wins_by = np.fromiter((win_by_can_miss(p, hp, t) for t in range(min_turns, turns)),
-                              sympy.Rational if exact else float, turns - min_turns)
+    wins_by = win_by_array(get_attacks_greedy(p), hp, turns)
 
     wins = np.ediff1d(wins_by, to_begin=wins_by[0])
-    exp = np.arange(min_turns, turns) * wins
+    exp = np.arange(1, turns + 1) * wins
     return np.sum(exp), np.sum(exp * wins)  # type: ignore
+
+
+def attack_choice(p: Player, up_to: int):
+    choice_list = [None]
+    # turn list, a list of roughly how many turns expected to kill something if thing is at n hp
+    hp_list = [0]
+    # start the for loop, with hp = 1, thus calculating for hp list, and helping us to build choices
+    enemy_hp = 1
+    for _ in range(up_to):
+        # for each one of the spells,
+        minimum = 100000
+        min_spell = 1000
+        for attack in p.attacks:
+            expect = 1
+
+            # for each one of the damages in dsl, attempt to calculate the number of turns it'll take
+            # if it goes does n damage for rest of combat
+            for i in range(min(len(attack.poly), enemy_hp)):
+                if i == 0:
+                    expect += attack.poly[0] / (1 - attack.poly[0])
+                expect += attack.poly[i] * hp_list[enemy_hp - i - 1]
+            if minimum > expect:
+                minimum = expect
+                min_spell = attack
+        enemy_hp += 1
+
+        hp_list.append(minimum)
+        choice_list.append(min_spell)
+
+    return choice_list
+
+
+split_cache = {}
+
+
+def _split(choices: Sequence[Attack], enemy_hp: int, turns_remaining: int, out: np.ndarray):
+    if enemy_hp <= 0:
+        return 1
+    if turns_remaining == 0:
+        return 0
+    c_hash = hash(choices)
+    if chance := split_cache.get((c_hash, enemy_hp, turns_remaining)):
+        out[turns_remaining - 1] += chance
+        return chance
+    poly = choices[enemy_hp].poly
+    chance = np.sum(poly * np.fromiter(
+        (_split(choices, hp, turns_remaining - 1, out) for hp in range(enemy_hp, enemy_hp - len(poly) - 1, -1)),
+        gmpy2.mpq, len(poly)
+    ))
+    out[turns_remaining - 1] += chance
+    print(chance)
+    split_cache[(c_hash, enemy_hp, turns_remaining)] = chance
+    return chance
+
+
+def split(p: Player, enemy_hp: int, turns: int):
+    choices = attack_choice(p, enemy_hp)
+    out = np.zeros(turns, dtype=gmpy2.mpq)
+    _split(tuple(choices), enemy_hp, turns, out[::-1])
+    return out
+
+
+def main():
+    sw = 5
+    if sw == 0:
+        print(w := win_chances(
+            Player(3, {Attack.from_dice({3: 1}, gmpy2.mpq(1, 2)): 0}, 1),
+            Player(3, {Attack.from_dice({3: 1}, gmpy2.mpq(1, 2)): 0}, 1),
+            2
+        ))
+        print([float(x) for x in w])
+    elif sw == 1:
+        a, b = battle_outcomes(
+            10, {Attack.from_dice({2: 1}, gmpy2.mpq(1, 2)): 8},
+            10, {Attack.from_dice({2: 1}, gmpy2.mpq(1, 2)): 7,
+                 Attack.from_dice({2: 2}, gmpy2.mpq(1, 2)): 1},
+            17, 17
+        )
+        print(a.astype(float))
+        print(b.astype(float))
+    elif sw == 2:
+        exp, var = expected_var(Player(3, {Attack.from_dice({2: 2}, gmpy2.mpq(1, 1)): 0}, 1), 20, 100)
+        print(exp, var)
+        print(float(exp), float(var))
+    elif sw == 3:
+        print(attack_choice(Player(12, {Attack.from_dice({3: 1}, gmpy2.mpq(1, 2)): 0}, 1), 14))
+    elif sw == 4:
+        print(exhaustive(
+            Player(10, {Attack.from_dice({2: 1}, gmpy2.mpq(1, 2)): 0}, 1),
+            Player(8, {Attack.from_dice({2: 1}, gmpy2.mpq(1, 2)): 0,
+                       Attack.from_dice({2: 2}, gmpy2.mpq(1, 2)): 2}, 1),
+            100
+        ))
+    elif sw == 5:
+        print(split(Player(8, {Attack.from_dice({2: 1}, gmpy2.mpq(1, 2)): 0,
+                               Attack.from_dice({2: 2}, gmpy2.mpq(1, 2)): 2}, 1), 12, 5))
+
+
+if __name__ == '__main__':
+    main()
